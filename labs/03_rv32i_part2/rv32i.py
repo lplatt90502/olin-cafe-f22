@@ -6,7 +6,7 @@ except:
     )
 import re
 
-pattern_immediate_offset_register = "(-?\d+)\((\w+)\)"
+pattern_immediate_offset_register = "(-?(0x)?\d+)\((\w+)\)"
 
 register_names = [
     ["x0", "zero"],  # zero constant
@@ -149,9 +149,30 @@ class LineException(Exception):
     pass
 
 
-def check_imm(imm, bits):
-    if imm >= 2 ** (bits - 1) or imm < -(2 ** (bits - 1)):
+def check_immediate_bounds(imm, bits, signed=True):
+    min_val = 0
+    max_val = 2**bits - 1
+    if signed:
+        min_val = -(2 ** (bits - 1))
+        max_val = 2 ** (bits - 1) - 1
+    if imm > max_val or imm < min_val:
         raise LineException(f"Immediate {imm} does not fit into {bits} bits.")
+
+
+def process_imm(imm, bits, signed=True):
+    original = imm
+    imm = imm.strip()
+    negative = imm.startswith("-")
+    if negative:
+        imm = imm[1:]
+    if "0x" in imm:
+        imm = int(imm, 16)
+    else:
+        imm = int(imm)
+    if negative:
+        imm *= -1
+    check_immediate_bounds(imm, bits, signed)
+    return imm
 
 
 def line_to_bits(line, labels={}, address=0):
@@ -184,9 +205,13 @@ def line_to_bits(line, labels={}, address=0):
         rd, rs1, imm12 = args
         rd = register_to_bits(rd)
         rs1 = register_to_bits(rs1)
-        imm12 = int(imm12)
-        check_imm(imm12, 12)
+
+        imm12 = process_imm(imm12, 12)
         imm12 = BitArray(int=imm12, length=12)
+        if instruction in ["slli", "srli"]:
+            imm12[0:7] = "0b0000000"
+        if instruction == "srai":
+            imm12[0:7] = "0b0100000"
         bits = (
             imm12
             + rs1
@@ -203,14 +228,10 @@ def line_to_bits(line, labels={}, address=0):
             raise LineException(
                 "Load: immediate offset incorrectly formatted."
             )
-        imm12 = int(match.group(1))
-        check_imm(imm12, 12)
-        imm12 = BitArray(int=int(match.group(1)), length=12)
-        if instruction in ["slli", "srli"]:
-            imm12[0:7] = "0b0000000"
-        if instruction == "srai":
-            imm12[0:7] = "0b0100000"
-        rs = register_to_bits(match.group(2))
+        imm12 = process_imm(match.group(1), 12)
+        imm12 = BitArray(int=imm12, length=12)
+
+        rs = register_to_bits(match.group(3))
         rd = register_to_bits(rd)
         bits = (
             imm12 + rs + funct3_codes[instruction] + rd + op_codes[instruction]
@@ -222,10 +243,9 @@ def line_to_bits(line, labels={}, address=0):
             raise LineException(
                 "Load: immediate offset incorrectly formatted.",
             )
-        imm12 = int(match.group(1))
-        check_imm(imm12, 12)
+        imm12 = process_imm(match.group(1), 12)
         imm12 = BitArray(int=int(match.group(1)), length=12)
-        rs1 = register_to_bits(match.group(2))
+        rs1 = register_to_bits(match.group(3))
         rs2 = register_to_bits(rs2)
         # bitstring slicing is opposite to Verilog (0 is MSB)
         bits = (
@@ -245,24 +265,16 @@ def line_to_bits(line, labels={}, address=0):
                 f"label '{label}' was not in the stored table.",
             )
         offset = int(labels[label]) - address
-        # offset = offset >> 1  # TODO(avinash) double check
-        check_imm(offset, 12)
+        offset = offset >> 1
+        check_immediate_bounds(offset, 12)
         imm12 = BitArray(int=offset, length=12)
-        print("#" * 48)
-
-        print(
-            f"Found a branch, setting BTA to offset = {offset}, "
-            f"imm12 = {imm12.int}, "
-            f"original offset = {int(labels[label]) - address} "
-        )
-        print("#" * 48 + "\n")
         bits = (
             imm12[0:1]
             + imm12[2:8]
             + rs2
             + rs1
             + funct3_codes[instruction]
-            + imm12[7:11]
+            + imm12[8:12]
             + imm12[1:2]
             + op_codes[instruction]
         )
@@ -273,13 +285,10 @@ def line_to_bits(line, labels={}, address=0):
             raise LineException(
                 f"label '{label}' was not in the stored table.",
             )
-        offset = (labels[label] - address) >> 1  # TODO(avinash) check
-        # {{12{IR[31]}}, IR[19:12], IR[20], IR[30:21], 1'b0};
-        #
-        check_imm(offset, 20)
+        offset = (labels[label] - address) >> 1
+        check_immediate_bounds(offset, 20)
         imm = BitArray(int=offset, length=20)
 
-        # IR [31|30:21|20|
         # imm[20|10:1|11|19:12] in normal bit order, this library makes us flip that
         # imm20,10:1,11,19:12
         imm20 = imm[0:1] + imm[10:20] + imm[9:10] + imm[1:9]
@@ -290,8 +299,8 @@ def line_to_bits(line, labels={}, address=0):
     if instruction in utypes:
         rd, upimm = args
         rd = register_to_bits(rd)
-        check_imm(upimm, 20)
-        upimm = BitArray(int=int(upimm), length=20)
+        upimm = process_imm(upimm, 20, signed=False)
+        upimm = BitArray(uint=upimm, length=20)
         bits = upimm + rd + op_codes[instruction]
 
     if not bits:
@@ -422,7 +431,7 @@ def bits_to_line(bits, labels=None):
         address = imm12
         if labels is None:
             return f"{op} {rs1}, {rs2}, {address.uint}"
-        address = address.int * 2  # TODO(avinash) check?
+        address = address.int * 2
         if address not in labels:
             labels[address] = f"LABEL_{len(labels)}"
         return f"{op} {rs1}, {rs2}, {labels[address]} # {labels[address]} <- {address}"
@@ -451,13 +460,6 @@ def bits_to_line(bits, labels=None):
             bits[1:11],  # 30:25
         ]
         imm20 = bits[0:1] + bits[12:20] + bits[11:12] + bits[1:11]
-        """
-        print("#" * 32)
-        print(tmp)
-        print(f"{imm20.bin} -> {imm20.int} len = {len(imm20)}")
-        print("#" * 32)
-        print("\n")
-        """
         address = imm20.int * 2
         if address % 4:
             raise Exception(
